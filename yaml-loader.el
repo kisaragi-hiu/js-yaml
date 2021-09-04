@@ -15,6 +15,15 @@
 ;; (require 'yaml-snippet)
 ;; (require 'yaml-schema-default)
 
+;; If you want `condition-case' to be able to dispatch on all these
+;; error conditions, you can define more granular errors with
+;; `define-error' at that point. It's best to keep it generic for now.
+(defun yaml-loader--throw-error (message)
+  "Throw a loader error.
+
+The error message is MESSAGE."
+  (signal 'yaml-loader (list message)))
+
 ;; Realistically, N is only ever going to be nil/0 or 1.
 (defmacro yaml-loader--set-char (state out-var &optional n)
   "Advance STATE.position by N and write the character to OUT-VAR.
@@ -109,21 +118,21 @@ ARGS can only contain one element, the YAML version (as a string).
 STATE is mutated to conform to the version."
   (let (major minor)
     (when (gethash :version state)
-      (yaml--throw-error state "duplication of %YAML directive"))
+      (yaml-loader--throw-error "Duplication of %YAML directive"))
 
     (when (/= 1 (length args))
-      (yaml--throw-error state "YAML directive accepts exactly one argument"))
+      (yaml-loader--throw-error "YAML directive accepts exactly one argument"))
 
     (save-match-data
       (unless (string-match (rx bol (group (one-or-more digit))
                                 "." (group (one-or-more digit)) eol)
                             (car args))
-        (yaml--throw-error state "ill-formed argument of the YAML directive"))
+        (yaml-loader--throw-error "Ill-formed argument of the YAML directive"))
       (setq major (string-to-number (match-string 1 (car args)))
             minor (string-to-number (match-string 2 (car args)))))
 
     (when (/= 1 major)
-      (yaml--throw-error state "unacceptable YAML version of the document"))
+      (yaml-loader--throw-error "unacceptable YAML version of the document"))
 
     (puthash :version (car args) state)
     (puthash :check-line-breaks (< minor 2) state)
@@ -138,19 +147,19 @@ ARGS can only contain two elements: the handle and the prefix.
 STATE is mutated to set up `:tag-map'."
   (let (handle prefix)
     (when (/= (length args) 2)
-      (yaml--throw-error state "TAG directive accepts exactly two arguments"))
+      (yaml-loader--throw-error "TAG directive accepts exactly two arguments"))
     (setq handle (elt args 0)
           prefix (elt args 1))
     (unless (yaml-loader--tag-handle? handle)
-      (yaml--throw-error
-       state "ill-formed tag handle (first argument) of the TAG directive"))
+      (yaml-loader--throw-error
+       "ill-formed tag handle (first argument) of the TAG directive"))
     (when (yaml-common--hash-has-key? (gethash :tag-map state) handle)
-      (yaml--throw-error
-       state (format "there is a previously declared suffix for \"%s\" tag handle"
-                     handle)))
+      (yaml-loader--throw-error
+       (format "there is a previously declared suffix for \"%s\" tag handle"
+               handle)))
     (unless (yaml-loader--tag-uri? prefix)
-      (yaml--throw-error
-       state "ill-formed tag prefix (second argument) of the TAG directive"))
+      (yaml-loader--throw-error
+       "ill-formed tag prefix (second argument) of the TAG directive"))
     ;; lib/loader.js::255
     ;;
     ;; DEVIATION: unlike decodeURIComponent, `url-unhex-string' will
@@ -183,10 +192,10 @@ STATE is mutated to set up `:tag-map'."
                  (let ((character (elt result position)))
                    (unless (or (= character #x09)
                                (<= #x20 character #x10FFFF))
-                     (yaml--throw-error state "expected valid JSON character"))
+                     (yaml-loader--throw-error "expected valid JSON character"))
                    (cl-incf position))))
        ((yaml-loader--contains-non-printable? result)
-        (yaml--throw-error state "the stream contains non-printable characters")))
+        (yaml-loader--throw-error "the stream contains non-printable characters")))
       (--> (concat (gethash :result state) result)
         (puthash :result it state)))))
 
@@ -275,8 +284,8 @@ STATE is mutated to set up `:tag-map'."
                       (setq has-content t)
                       (when (or (gethash :tag state)
                                 (gethash :anchor state))
-                        (yaml--throw-error
-                         state "alias node should not have any properties")))
+                        (yaml-loader--throw-error
+                         "alias node should not have any properties")))
                      ((yaml-loader--read-plain-scalar
                        state flow-indent (eq node-context 'context-flow-in))
                       (setq has-content t)
@@ -314,8 +323,7 @@ STATE is mutated to set up `:tag-map'."
            ;; I don't claim to know what any of that means.
            (when (and (gethash :result state)
                       (not (equal "scalar" (gethash :kind state))))
-             (yaml--throw-error
-              state
+             (yaml-loader--throw-error
               (format "unacceptable node kind for !<?> tag; it should be \"scalar\", not \"%s\""
                       (gethash :kind state))))
            ;; lib/loader.js::1492
@@ -355,15 +363,14 @@ STATE is mutated to set up `:tag-map'."
                (setq type tp)))
 
            (unless type
-             (yaml--throw-error
-              state (format "unknown tag !<%s>" (gethash :tag state))))
+             (yaml-loader--throw-error
+              (format "unknown tag !<%s>" (gethash :tag state))))
 
            ;; lib/loader.js::1524
            (when (and (gethash :result state)
                       (not (equal (gethash :kind type)
                                   (gethash :kind state))))
-             (yaml--throw-error
-              state
+             (yaml-loader--throw-error
               (format "unacceptable node kind for !<%s> tag; it should be \"%s\", not \"%s\""
                       (gethash :tag state)
                       (gethash :kind type)
@@ -371,9 +378,9 @@ STATE is mutated to set up `:tag-map'."
 
            ;; state.result updated in resolver if matched
            (if (not (yaml-type-resolve (gethash :result state) (gethash :tag state)))
-               (yaml--throw-error
-                state (format "cannot resolve a node with !<%s> explicit tag"
-                              (gethash :tag state)))
+               (yaml-loader--throw-error
+                (format "cannot resolve a node with !<%s> explicit tag"
+                        (gethash :tag state)))
              ;; lib/loader.js::1531
              (--> (yaml-type-construct (gethash :result state)
                                        (gethash :tag state))
@@ -423,8 +430,8 @@ STATE is mutated to set up `:tag-map'."
                 directive-args nil)
 
           (when (< (length directive-name) 1)
-            (yaml--throw-error
-             state "directive name must not be less than one character in length"))
+            (yaml-loader--throw-error
+             "directive name must not be less than one character in length"))
 
           ;; lib/loader.js::1581
           (catch 'break
@@ -472,7 +479,7 @@ STATE is mutated to set up `:tag-map'."
         (cl-incf (gethash :position state) 3)
         (yaml-loader--skip-separation-space state t -1))
        (has-directives
-        (yaml--throw-error state "directives end mark is expected")))
+        (yaml-loader--throw-error "directives end mark is expected")))
 
       (yaml-loader--compose-node
        state (- (gethash :line-indent state) 1)
@@ -498,7 +505,8 @@ STATE is mutated to set up `:tag-map'."
 
       ;; state.length is set to state.input.length on initialization
       (if (< (gethash :position state) (1- (gethash :length state)))
-          (yaml--throw-error state "end of the stream or a document separator is expected")
+          (yaml-loader--throw-error
+           "end of the stream or a document separator is expected")
         (cl-return)))))
 
 (provide 'yaml-loader)
