@@ -6,10 +6,14 @@
 
 ;;; Code:
 
+(require 'cl-lib)
+(require 'dash)
+(require 's)
+
 (require 'yaml-common)
-(require 'yaml-exception)
-(require 'yaml-snippet)
-(require 'yaml-schema-default)
+;; (require 'yaml-exception)
+;; (require 'yaml-snippet)
+;; (require 'yaml-schema-default)
 
 ;; Realistically, N is only ever going to be nil/0 or 1.
 (defmacro yaml-loader--set-char (state out-var &optional n)
@@ -31,6 +35,7 @@ Returns the character at runtime."
 (defvar yaml-loader--chomping
   '(chomping-clip chomping-strip chomping-keep))
 
+;;;; Regexp
 (defun yaml-loader--contains-non-printable? (str)
   "Does STR contain non-printable characters?"
   (or
@@ -42,6 +47,86 @@ Returns the character at runtime."
 (defun yaml-loader--contains-non-ascii-line-breaks? (str)
   "Does STR contain non-ASCII line breaks?"
   (s-matches? "[\x85\u2028\u2029]" str))
+
+;; lib/loader.js::28
+(defun yaml-loader--tag-handle? (str)
+  "Is STR a tag handle?"
+  (let ((case-fold-search t))
+    (s-matches?
+     (rx bol
+         (or "!"
+             "!!"
+             (seq "!" (any "a-z" "-") "!"))
+         eol)
+     str)))
+
+;;;; Directive handlers
+(defun yaml-loader--handle-yaml-directive (state _name args)
+  "Handle the YAML directive.
+
+ARGS can only contain one element, the YAML version (as a string).
+STATE is mutated to conform to the version."
+  (let (major minor)
+    (when (gethash :version state)
+      (yaml--throw-error state "duplication of %YAML directive"))
+
+    (when (/= 1 (length args))
+      (yaml--throw-error state "YAML directive accepts exactly one argument"))
+
+    (save-match-data
+      (unless (string-match (rx bol (group (one-or-more digit))
+                                "." (group (one-or-more digit)) eol)
+                            (car args))
+        (yaml--throw-error state "ill-formed argument of the YAML directive"))
+      (setq major (string-to-number (match-string 1 (car args)))
+            minor (string-to-number (match-string 2 (car args)))))
+
+    (when (/= 1 major)
+      (yaml--throw-error state "unacceptable YAML version of the document"))
+
+    (puthash :version (car args) state)
+    (puthash :check-line-breaks (< minor 2) state)
+
+    (unless (memq minor '(1 2))
+      (yaml--throw-warning state "unsupported YAML version of the document"))))
+
+(defun yaml-loader--handle-tag-directive (state _name args)
+  "Handle tag directives.
+
+ARGS can only contain two elements: the handle and the prefix.
+STATE is mutated to set up `:tag-map'."
+  (let (handle prefix)
+    (when (/= (length args) 2)
+      (yaml--throw-error state "TAG directive accepts exactly two arguments"))
+    (setq handle (elt args 0)
+          prefix (elt args 1))
+    (unless (yaml-loader--tag-handle? handle)
+      (yaml--throw-error
+       state "ill-formed tag handle (first argument) of the TAG directive"))
+    (when (yaml-common--hash-has-key? (gethash :tag-map state) handle)
+      (yaml--throw-error
+       state (format "there is a previously declared suffix for \"%s\" tag handle"
+                     handle)))
+    (unless (yaml-loader--tag-uri? prefix)
+      (yaml--throw-error
+       state "ill-formed tag prefix (second argument) of the TAG directive"))
+    ;; lib/loader.js::255
+    ;;
+    ;; DEVIATION: unlike decodeURIComponent, `url-unhex-string' will
+    ;; not complain about malformed uris.
+    ;;
+    ;; (url-unhex-string "%3Fx%3test") -> "?x%3test"
+    ;; decodeURIComponent("%3Fx%3test") -> Error: malformed URI sequence
+    ;;
+    ;; As such, I'm not checking for malformed tag prefixes here.
+    (puthash handle prefix (gethash :tag-map state))))
+
+(defvar yaml-loader--directive-handlers
+  `(
+    :YAML yaml-loader--handle-yaml-directive
+    :TAG yaml-loader--handle-tag-directive))
+
+;;;; etc.
 
 ;; lib/loader.js::266
 (defun yaml-loader--capture-segment (state start end check-json)
@@ -64,6 +149,206 @@ Returns the character at runtime."
       (--> (concat (gethash :result state) result)
         (puthash :result it state)))))
 
+(defun yaml-loader--compose-node (state parent-indent node-context allow-to-seek allow-compact)
+  (let (allow-block-styles
+        allow-block-scalars
+        allow-block-collections
+        (indent-status 1) ; 1: this>parent, 0: this=parent, -1: this<parent
+        (at-new-line nil)
+        (has-content nil)
+        type-index
+        type-quantity
+        type-list
+        type
+        flow-indent
+        block-indent)
+
+    (when (gethash :listener state)
+      (funcall (gethash :listener state) "open" state))
+
+    ;; lib/loader.js::1383
+    (puthash :tag nil state)
+    (puthash :anchor nil state)
+    (puthash :kind nil state)
+    (puthash :result nil state)
+
+    ;; lib/loader.js::1388
+    (when (memq node-context '(context-block-in context-block-out))
+      (setq allow-block-styles t
+            allow-block-scalars t
+            allow-block-collections t))
+
+    ;; lib/loader.js::1392
+    (when allow-to-seek
+      (when (yaml-loader--skip-separation-space state t -1)
+        (setq at-new-line t)
+        (cond ((> (gethash :line-indent state) parent-indent)
+               (setq indent-status 1))
+              ((= (gethash :line-indent state) parent-indent)
+               (setq indent-status 0))
+              ((< (gethash :line-indent state) parent-indent)
+               (setq indent-status -1)))))
+
+    ;; lib/loader.js::1406
+    (when (= 1 indent-status)
+      (while (or (yaml-loader--read-tag-property state)
+                 (yaml-loader--read-anchor-property state))
+        (if (yaml-loader--skip-separation-space state t -1)
+            (progn
+              (setq at-new-line t
+                    allow-block-collections allow-block-styles)
+              (cond ((> (gethash :line-indent state) parent-indent)
+                     (setq indent-status 1))
+                    ((= (gethash :line-indent state) parent-indent)
+                     (setq indent-status 0))
+                    ((< (gethash :line-indent state) parent-indent)
+                     (setq indent-status -1))))
+          (setq allow-block-collections nil))))
+
+    (when allow-block-collections
+      (setq allow-block-collections (or at-new-line allow-compact)))
+
+    ;; lib/loader.js::1429
+    (when (or (= indent-status 1)
+              (eq node-context 'context-block-out))
+      (if (memq node-context '(context-flow-int context-flow-out))
+          (setq flow-indent parent-indent)
+        (setq flow-indent (1+ parent-indent)))
+
+      (setq block-indent (- (gethash :position state)
+                            (gethash :line-start state)))
+
+      ;; lib/loader.js::1438
+      (cond ((= indent-status 1)
+             (if (or (and allow-block-collections
+                          (or (yaml-loader--read-block-sequence state block-indent)
+                              (yaml-loader--read-block-mapping state block-indent flow-indent)))
+                     (yaml-loader--read-flow-collection state flow-indent))
+                 (setq has-content t)
+               (cond ((or (and allow-block-scalars
+                               (yaml-loader--read-block-scalar state flow-indent))
+                          (yaml-loader--read-single-quoted-scalar state flow-indent)
+                          (yaml-loader--read-double-quoted-scalar state flow-indent))
+                      (setq has-content t))
+                     ((yaml-loader--read-alias state)
+                      (setq has-content t)
+                      (when (or (gethash :tag state)
+                                (gethash :anchor state))
+                        (yaml--throw-error
+                         state "alias node should not have any properties")))
+                     ((yaml-loader--read-plain-scalar
+                       state flow-indent (eq node-context 'context-flow-in))
+                      (setq has-content t)
+                      (unless (gethash :tag state)
+                        (puthash :tag state "?"))))
+               (when (gethash :anchor state)
+                 (puthash (gethash :anchor state)
+                          (gethash :result state)
+                          (gethash :anchor-map state)))))
+            ;; lib/loader.js::1469
+            ((= indent-status 0)
+             ;; Special case: block sequences are allowed to have same indentation level as the parent.
+             ;; http://www.yaml.org/spec/1.2/spec.html#id2799784
+             (setq has-content (and allow-block-collections
+                                    (yaml-loader--read-block-sequence
+                                     state block-indent))))))
+
+    ;; lib/loader.js::1476
+    (cond ((null (gethash :tag state))
+           (when (gethash :anchor state)
+             (puthash (gethash :anchor state)
+                      (gethash :result state)
+                      (gethash :anchor-map state))))
+          ((string= (gethash :tag state) "?")
+           ;; Implicit resolving is not allowed for non-scalar types,
+           ;; and '?' non-specific tag is only automatically assigned
+           ;; to plain scalars.
+           ;;
+           ;; We only need to check kind conformity in case user
+           ;; explicitly assigns '?' tag, for example like this:
+           ;; "!<?> [0]"
+           ;;
+           ;; --- Comment at lib/loader.js::1482
+           ;;
+           ;; I don't claim to know what any of that means.
+           (when (and (gethash :result state)
+                      (not (equal "scalar" (gethash :kind state))))
+             (yaml--throw-error
+              state
+              (format "unacceptable node kind for !<?> tag; it should be \"scalar\", not \"%s\""
+                      (gethash :kind state))))
+           ;; lib/loader.js::1492
+           (-when-let (tp
+                       ;; resolver updates state.result if matched
+                       (--first (yaml-type-resolve it (gethash :result state))
+                                (gethash :implicit-types state)))
+             (--> (yaml-type-construct tp (gethash :result state))
+               (puthash :result it state))
+             (puthash :tag state (gethash :tag tp))
+             (when (gethash :anchor state)
+               (puthash (gethash :anchor state)
+                        (gethash :result state)
+                        (gethash :anchor-map state)))))
+          ((not (string= (gethash :tag state) "!"))
+           ;; lib/loader.js::1505
+           (if (yaml-common--hash-has-key? (gethash (or (gethash :kind state)
+                                                        "fallback")
+                                                    (gethash :type-map state))
+                                           (gethash :tag state))
+               (setq type (->> state
+                            (gethash :type-map)
+                            (gethash (or (gethash :kind state)
+                                         "fallback"))
+                            (gethash (gethash :tag state))))
+             ;; lib/loader.js::1508
+             ;; looking for multi type
+             (setq type nil
+                   type-list (->> state
+                               (gethash :type-map)
+                               (gethash :multi)
+                               (gethash (or (gethash :kind state)
+                                            "fallback"))))
+             (-when-let (tp (--first (s-prefix? (gethash :tag it)
+                                                (gethash :tag state))
+                                     type-list))
+               (setq type tp)))
+
+           (unless type
+             (yaml--throw-error
+              state (format "unknown tag !<%s>" (gethash :tag state))))
+
+           ;; lib/loader.js::1524
+           (when (and (gethash :result state)
+                      (not (equal (gethash :kind type)
+                                  (gethash :kind state))))
+             (yaml--throw-error
+              state
+              (format "unacceptable node kind for !<%s> tag; it should be \"%s\", not \"%s\""
+                      (gethash :tag state)
+                      (gethash :kind type)
+                      (gethash :kind state))))
+
+           ;; state.result updated in resolver if matched
+           (if (not (yaml-type-resolve (gethash :result state) (gethash :tag state)))
+               (yaml--throw-error
+                state (format "cannot resolve a node with !<%s> explicit tag"
+                              (gethash :tag state)))
+             ;; lib/loader.js::1531
+             (--> (yaml-type-construct (gethash :result state)
+                                       (gethash :tag state))
+               (puthash :result it state))
+             (when (gethash :anchor state)
+               (puthash (gethash :anchor state)
+                        (gethash :result state)
+                        (gethash :anchor-map state))))))
+
+    (when (gethash :listener state)
+      (funcall (gethash :listener state) "close" state))
+
+    (not (not (or (gethash :tag state)
+                  (gethash :anchor state)
+                  has-content)))))
+
 ;; lib/loader.js::1544
 (defun yaml-loader--read-document (state)
   (cl-block nil
@@ -82,7 +367,7 @@ Returns the character at runtime."
 
           (when (or (> (gethash :line-indent state) 0)
                     (/= ch ?%))
-            (throw 'break))
+            (throw 'break nil))
 
           (setq has-directives t)
           (yaml-loader--set-char state ch 1)
@@ -109,9 +394,9 @@ Returns the character at runtime."
                 (cl-loop do (yaml-loader--set-char state ch 1)
                          while (and (/= ch 0)
                                     (not (yaml-loader--eol? ch))))
-                (throw 'break))
+                (throw 'break nil))
               (when (yaml-loader--eol? ch)
-                (throw 'break))
+                (throw 'break nil))
               (setq position (gethash :position state))
               (while (and (/= ch 0)
                           (not (yaml-loader--ws-or-eol? ch)))
@@ -123,10 +408,11 @@ Returns the character at runtime."
           (when (/= ch 0)
             (yaml-loader--read-line-break state))
 
-          (if (yaml-common--hash-has-key?
+          (if (plist-member
                yaml-loader--directive-handlers
-               directive-name)
-              (funcall (gethash yaml-loader--directive-handlers directive-name)
+               (intern (concat ":" directive-name)))
+              (funcall (plist-get yaml-loader--directive-handlers
+                                  (intern (concat ":" directive-name)))
                        state directive-name directive-args)
             (yaml--throw-warning
              state (format "unknown document directive \"%s\"" directive-name)))))
