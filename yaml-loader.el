@@ -35,6 +35,47 @@ Returns the character at runtime."
 (defvar yaml-loader--chomping
   '(chomping-clip chomping-strip chomping-keep))
 
+(defun yaml-loader--state (input options)
+  "Initialize a new state with INPUT and OPTIONS.
+
+OPTIONS should be a plist."
+  (let ((ht (make-hash-table)))
+    (puthash :input input ht)
+    (puthash :length (length input) ht)
+
+    (dolist (prop (list :filename :on-warning :json :listener
+                        ;; Makes the loader expect YAML 1.1 if no %YAML
+                        ;; directive is given
+                        :legacy))
+      (puthash prop (plist-get prop options) ht))
+
+    (dolist (prop (list :position :line :line-start :line-indent))
+      (puthash prop 0 ht))
+
+    ;; position of first leading tab in the current line,
+    ;; used to make sure there are no tabs in the indentation
+    (puthash :first-tab-in-line -1 ht)
+
+    ;; Other props "initialized" to nil:
+    ;; - :documents
+    ;; - :version
+    ;; - :check-line-breaks
+    ;; - :tag
+    ;; - :anchor
+    ;; - :kind
+    ;; - :result
+    ;; "initialized" to nil, but maybe we should initialize to a new
+    ;; hash table here instead of in read-cocument?
+    ;; - :tag-map
+    ;; - :anchor-map
+
+    (let ((schema (or (plist-get :schema options) yaml-schema-default)))
+      (puthash :schema schema ht)
+      (--> (gethash :compiled-implicit schema)
+        (puthash :implicit-types it ht))
+      (--> (gethash :compiled-type-map schema)
+        (puthash :type-map it ht)))))
+
 ;;;; Regexp
 (defun yaml-loader--contains-non-printable? (str)
   "Does STR contain non-printable characters?"
